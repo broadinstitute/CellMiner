@@ -1,9 +1,11 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import animation
+from matplotlib import colors as mcolors
 import matplotlib.cm as cm
 import matplotlib.patches as mpatches
 from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 from skimage.morphology import closing, square
 from skimage.measure import label, regionprops
 from skimage.filters import threshold_otsu
@@ -31,7 +33,7 @@ def plot_cdf(x):
     plt.plot(x, y, 'ro')
 
 
-def imshow(tensor, dim=None, title='', figsize=(20, 10), show_colorbar=True, **kwargs):
+def imshow(tensor, dim=None, title='', figsize=(20, 10), show_colorbar=True, show=True, save_file=None, display=True, **kwargs):
     if isinstance(tensor, torch.Tensor):
         tensor = tensor.squeeze().detach().cpu().numpy()
     fig, ax = plt.subplots(figsize=figsize)
@@ -42,11 +44,20 @@ def imshow(tensor, dim=None, title='', figsize=(20, 10), show_colorbar=True, **k
     if title != '':
         plt.title(title)
     if show_colorbar:
-        fig.colorbar(im)
-    plt.show()
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="2%", pad=0.1)
+        fig.colorbar(im, cax=cax)
+    if save_file is not None:
+        plt.savefig(save_file)
+    if not display:
+        plt.close()
+        return
+    if show:
+        plt.show()
 
 
-def plot_image_label_overlay(image, label_image, sel_idx=None, regions=None, figsize=(20, 10), show=True, title=None, save_file=None):
+def plot_image_label_overlay(image, label_image, sel_idx=None, regions=None, figsize=(20, 10), show=True, title=None, save_file=None, 
+                            bounding_box=True, display=True):
     """Plot image_label_overlay
     
     Args:
@@ -56,23 +67,29 @@ def plot_image_label_overlay(image, label_image, sel_idx=None, regions=None, fig
     """
     if isinstance(image, torch.Tensor):
         image = image.detach().cpu().numpy()
+    if isinstance(label_image, torch.Tensor):
+        label_image = label_image.detach().cpu().numpy()
     if regions is None:
         regions = regionprops(label_image)
     image_label_overlay = label2rgb(label_image, image=image)
     fig, ax = plt.subplots(figsize=figsize)
     ax.imshow(image_label_overlay)
-    for i, region in enumerate(regions):
-        minr, minc, maxr, maxc = region.bbox
-        rect = mpatches.Rectangle((minc, minr), maxc - minc, maxr - minr,
-                                  fill=False, edgecolor='red' if sel_idx is not None and i==sel_idx else 'green', linewidth=2)
-        ax.add_patch(rect)
-        ax.text(minc, minr, i+1, color='r')
+    if bounding_box:
+        for i, region in enumerate(regions):
+            minr, minc, maxr, maxc = region.bbox
+            rect = mpatches.Rectangle((minc, minr), maxc - minc, maxr - minr,
+                                      fill=False, edgecolor='red' if sel_idx is not None and i==sel_idx else 'green', linewidth=2)
+            ax.add_patch(rect)
+            ax.text(minc, minr, i+1, color='r')
     ax.set_axis_off()
     plt.tight_layout()
     if title is not None:
         plt.title(title)
     if save_file is not None:
         plt.savefig(save_file)
+    if not display:
+        plt.close()
+        return
     if show:
         plt.show()
 
@@ -383,7 +400,7 @@ def get_lines(num_points, size=None, points=None, image=None, tolerance=1e-4, va
     return image
 
         
-def make_video(array, num_frames=None, interval=20, start_idx=0, cmap='viridis', repeat=True, show_title=False, title=None):
+def make_video(array, num_frames=None, interval=20, start_idx=0, cmap='viridis', repeat=True, show_title=False, title=None, figsize=None, **kwargs):
     """Make 2D videos for 2D arrays
     
     Arguments:
@@ -400,8 +417,8 @@ def make_video(array, num_frames=None, interval=20, start_idx=0, cmap='viridis',
     assert array.ndim == 3
     if num_frames is None:
         num_frames = array.shape[0]
-    fig, ax = plt.subplots()
-    img = plt.imshow(array[start_idx], cmap=cmap)
+    fig, ax = plt.subplots(figsize=figsize)
+    img = plt.imshow(array[start_idx], cmap=cmap, **kwargs)
     def animate(i, start=start_idx, show_title=show_title):
         img.set_data(array[start_idx+i])
         if show_title:
@@ -454,3 +471,141 @@ def make_3d_video(data, interval=100, zlim=None, title='', cmap=cm.coolwarm, rep
                                        interval=interval, blit=False, repeat=repeat)
     vid = ani.to_html5_video()
     return vid
+
+def make_video_from_mat(mat, interval=20, start_idx=0, cmap=plt.cm.binary_r, repeat=False, figsize=(15, 10)):
+    vmin = mat.min()
+    vmax = mat.max()
+    vid = make_video(mat, num_frames=None, interval=interval, start_idx=start_idx, cmap=cmap, repeat=repeat, figsize=figsize, 
+                      vmin=vmin, vmax=vmax)
+    return vid
+
+# def make_video_ffmpeg__obsolete(mat, save_path, vmin=None, vmax=None, clip=False, clip_low=50, clip_high=99):
+#     import skvideo
+#     from skvideo import io as skio
+#     from matplotlib.colors import Normalize
+#     if clip:
+#         vmin = get_percentile(mat, clip_low)
+#         vmax = get_percentile(mat, clip_high)
+#     if vmin is None:
+#         vmin = mat.min()
+#     if vmax is None: 
+#         vmax = mat.max()
+#     norm = Normalize(vmin=vmin, vmax=vmax, clip=clip)
+#     if isinstance(mat, torch.Tensor):
+#         mat = mat.detach().cpu().numpy()
+#     if mat.ndim > 3:
+#         mat = mat.reshape(-1, mat.shape[-2], mat.shape[-1])
+#     mat = (255 * norm(mat)[..., None]).astype(np.uint8)
+#     writer = skio.FFmpegWriter(
+#         save_path,
+#         outputdict={'-vcodec': 'rawvideo', '-pix_fmt': 'yuv420p', '-r': '60'})
+#     for i in range(len(mat)):
+#         writer.writeFrame(mat[i])
+#     writer.close()
+      
+def make_video_ffmpeg(mat, save_path, fps=60, outputdict={'-vcodec': 'rawvideo'}, normalize=True,
+                      vmin=None, vmax=None, clip=False, clip_low=50, clip_high=99, gray=False):
+    from skvideo import io as skio
+    if isinstance(mat, torch.Tensor):
+        mat = mat.detach().cpu().numpy()
+    if gray and mat.ndim > 3:
+        mat = mat.reshape(-1, *mat.shape[-2:])
+    if normalize:
+        from matplotlib.colors import Normalize
+        if clip:
+            vmin = get_percentile(mat, clip_low)
+            vmax = get_percentile(mat, clip_high)
+        if vmin is None:
+            vmin = mat.min()
+        if vmax is None: 
+            vmax = mat.max()
+        norm = Normalize(vmin=vmin, vmax=vmax, clip=clip)
+        mat = 255 * norm(mat)
+    mat = mat.astype(np.uint8)
+    writer = skio.FFmpegWriter(save_path, {'-r': f'{fps}'}, outputdict=outputdict)
+    for i in range(len(mat)):
+        writer.writeFrame(mat[i])
+    writer.close()
+    
+def get_good_colors(num=None, max_num=100, min_dist=0.15, min_dist_white=0.3, 
+                    seed=None, all_colors=None, alpha=0.7):
+    if seed is None:
+        colors = ['b', 'r', 'g', 'm', 'c', 'y', 'k', 'maroon', 'blueviolet', 'chocolate', 'gold']
+    else:
+        colors = seed.copy()
+    if all_colors is None:
+        all_colors = sorted(mcolors.CSS4_COLORS)
+    if num is None:
+        num = max_num
+    while len(colors)<max_num and len(all_colors)>0:
+        rgb = np.array([mcolors.to_rgb(c) for c in colors])
+        hsv = np.array([mcolors.rgb_to_hsv(c) for c in rgb])
+        rgb2 = np.array([mcolors.to_rgb(c) for c in all_colors])
+        hsv2 = np.array([mcolors.rgb_to_hsv(c) for c in rgb2])
+        d_rgb = np.linalg.norm(rgb2[:, np.newaxis] - rgb, axis=2).min(axis=1)
+        d_hsv = np.linalg.norm(hsv2[:, np.newaxis] - hsv, axis=2).min(axis=1)
+        d = d_rgb*(1-alpha) + d_hsv*alpha
+        if np.linalg.norm(hsv2[d.argmax(), 1:] - [0, 1]) > min_dist_white: # exclude white ([0, 0, 1]) and white-alike
+            colors.append(all_colors[d.argmax()])
+        del all_colors[d.argmax()]
+        if d.max() < min_dist or len(colors)==num:
+            break
+    return colors
+    
+def plot_colortable(colors, title='Selected Colors', sort_colors=False, cell_width=300, emptycols=0):
+    cell_height = 20
+    swatch_width = 20
+    margin = 12
+    topmargin = 20
+
+    by_hsv = list((tuple(mcolors.rgb_to_hsv(mcolors.to_rgb(color))), color) for color in colors)
+    # Sort colors by hue, saturation, value and name.
+    if sort_colors is True:
+        by_hsv = sorted(by_hsv)
+    names = [name for hsv, name in by_hsv]
+
+    n = len(names)
+    ncols = 4 - emptycols
+    nrows = n // ncols + int(n % ncols > 0)
+
+    width = cell_width * 4 + 2 * margin
+    height = cell_height * nrows + margin + topmargin
+    dpi = 72
+
+    fig, ax = plt.subplots(figsize=(width / dpi, height / dpi), dpi=dpi)
+    fig.subplots_adjust(margin/width, margin/height,
+                        (width-margin)/width, (height-topmargin)/height)
+    ax.set_xlim(0, cell_width * 4)
+    ax.set_ylim(cell_height * (nrows-0.5), -cell_height/2.)
+    ax.yaxis.set_visible(False)
+    ax.xaxis.set_visible(False)
+    ax.set_axis_off()
+    ax.set_title(title, fontsize=24, loc="left", pad=10)
+
+    for i, name in enumerate(names):
+        row = i % nrows
+        col = i // nrows
+        y = row * cell_height
+
+        swatch_start_x = cell_width * col
+        swatch_end_x = cell_width * col + swatch_width
+        text_pos_x = swatch_end_x + 7
+
+        ax.text(text_pos_x, y, ','.join(map('{:.1f}'.format, by_hsv[i][0]))+f' {by_hsv[i][1]}', fontsize=14,
+                horizontalalignment='left',
+                verticalalignment='center')
+
+        ax.hlines(y, swatch_start_x, swatch_end_x,
+                  color=name, linewidth=18)
+        
+        
+def save_gif_file(imgs, save_path, duration_per_frame=1500):
+    from PIL import Image, ImageSequence
+    frames = []
+    for img in imgs:
+        new_frame = Image.open(img)
+        frames.append(new_frame)
+    frames[0].save(save_path, format='GIF',
+                   append_images=frames[1:],
+                   save_all=True,
+                   duration=duration_per_frame, loop=0)

@@ -1,29 +1,20 @@
-import os, functools
+import os, functools, subprocess, json, time, shutil
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import pandas
 from sklearn.cluster import KMeans
+from skimage.measure import regionprops
+from skimage.color import label2rgb
 
 import torch
 import torch.nn as nn
 
-from utility import linear_regression, power_series, empty_cache, get_label_image, neighbor_cor, svd
-from models import get_bg_mat
-from visualization import plot_tensor, plot_image_label_overlay, imshow, plot_hist, plot_curves, plot_singular_values
+from utility import linear_regression, power_series, empty_cache, get_label_image, neighbor_cor, svd, get_local_median, get_cor_map_4d
+from models import get_bg_mat, UNet
+from visualization import plot_tensor, plot_image_label_overlay, imshow, plot_hist, plot_curves, plot_singular_values, save_gif_file
 from train import step_decompose
-
-
-def refine_segmentation(submat, label_mask, label_image, label_idx, plot=False, figsize=(15, 10)):
-    num_pcs, u, s, v = svd(submat[:, label_mask.bool()], plot=plot)
-    if num_pcs >= 2:
-        A, B, loss_history = step_decompose(submat.reshape(submat.size(0), -1), num_components=2*num_pcs)
-        mask = B[0].reshape(submat.size(1), submat.size(2))
-        X = mask.reshape(-1).unsqueeze(-1)
-        kmeans = KMeans(n_clusters=2*num_pcs, random_state=0).fit(X.detach().cpu())
-        split_label_segmentation = kmeans.labels_.reshape(mask.shape)
-        label_image, regions = get_label_image(image=None, label_image=label_image, split_label=label_idx-1,
-                                               split_label_segmentation=split_label_segmentation, plot=plot, figsize=figsize)
 
 
 def get_size_from_txt(filepath):
@@ -77,8 +68,10 @@ def plot_mean_intensity(mat, detrended=None, plot_detrended=False, plot_segments
             plt.show()
 
 def detrend_linear(mat, train_idx=None, linear_order=3, input_min=-2, input_max=2, return_trend=False,
-                   device=torch.device('cuda')):
+                   input_transformation=None, device=torch.device('cuda')):
     input_aug = torch.linspace(input_min, input_max, mat.shape[0], device=device)
+    if input_transformation is not None:
+        input_aug = input_transformation(input_aug)
     if train_idx is None:
         train_idx = range(mat.shape[0])
     beta, trend = linear_regression(X=input_aug[train_idx], Y=mat.reshape(mat.shape[0], -1)[train_idx], order=linear_order,
@@ -227,14 +220,20 @@ def extract_single_trace(mat, label_mask, percentile=50):
     trace = (mat*label_mask*binary_mask).sum(-1).sum(-1) / label_mask[binary_mask].sum()
     return trace
 
-def extract_traces(mat, softmask, label_image, regions=None, percentile=50):
+def extract_traces(mat, softmask, label_image, regions=None, percentile=50, median_detrend=False):
     """
     Args:
         label_image: background: 0, labels: 1, 2, 3, ... (no skipping)
     """
     # assert len(np.unique(label_image)) == label_image.max()
     if regions is None:
-        regions = regionprops(label_image)
+        if isinstance(label_image, torch.Tensor):
+            label_image_ = label_image.detach().cpu().numpy()
+        else:
+            label_image_ = label_image
+        regions = regionprops(label_image_)
+    if not isinstance(label_image, torch.Tensor):
+        label_image = torch.from_numpy(label_image).to(mat.device)
     submats = []
     traces = []
     for i, region in enumerate(regions):
@@ -242,13 +241,17 @@ def extract_traces(mat, softmask, label_image, regions=None, percentile=50):
         submat = mat[:, minr:maxr, minc:maxc]
         sub_image = label_image[minr:maxr, minc:maxc]
         label_mask = softmask[minr:maxr, minc:maxc].clone()
-        label_mask[torch.from_numpy(sub_image!=i+1)] = 0
+        label_mask[sub_image!=i+1] = 0
         trace = extract_single_trace(submat, label_mask, percentile=percentile)
         submats.append(submat)
         traces.append(trace)
     for k in [k for k in locals().keys() if k not in ['submats', 'traces']]:
         del locals()[k]
+    if len(traces) > 0:
+        traces = torch.stack(traces, dim=0)
     torch.cuda.empty_cache()
+    if median_detrend:
+        traces = traces - get_local_median(traces, window_size=50, dim=1)
     return submats, traces
 
 def get_submat_traces(regions, label_image, seg_idx=0, mat_adj=None, sig_list=None, mat_list=None, mat=None, cor=None,
@@ -391,3 +394,258 @@ def prep_train_data(seg_idx, label_idx, label_image, regions, sig_list=None, mat
     trace = traces[label_idx]
     return x, y, trace, label_mask, weight
 
+
+def denoise_trace(trace, model=None, filepath='/home/jupyter/notebooks/checkpoints/denoise_trace.pt', return_detached=True, 
+                  device=torch.device('cuda')):
+    if model is None:
+        model = UNet(in_channels=1, num_classes=1, out_channels=[8, 16, 32], num_conv=2, 
+                     n_dim=1, kernel_size=3).to(device)
+        model.load_state_dict(torch.load(filepath))
+    with torch.no_grad():
+        mean = trace.mean()
+        std = trace.std()
+        pred = model((trace-mean)/std)
+        pred = model(pred)
+        pred = pred * std + mean
+    if return_detached:
+        pred = pred.detach()
+    for k in [k for k in locals().keys() if k!='pred']:
+        del locals()[k]
+    torch.cuda.empty_cache()
+    return pred
+
+def denoise_3d(mat, model=None, filepath='/home/jupyter/notebooks/checkpoints/3d_denoise.pt', return_detached=True, 
+               batch_size=5000, device=torch.device('cuda')):
+    if model is None:
+        model = UNet(in_channels=1, num_classes=1, out_channels=[4, 8, 16], num_conv=2, n_dim=3, 
+                     kernel_size=[3, 3, 3], same_shape=True).to(device)
+        model.load_state_dict(torch.load(filepath))
+    with torch.no_grad():
+        num_batches = (mat.size(0) + batch_size - 1)//batch_size
+        mat = torch.cat([model(mat[batch_size*i:batch_size*(i+1)]) for i in range(num_batches)], dim=0)
+    if return_detached:
+        mat = mat.detach()
+    for k in [k for k in locals().keys() if k!='mat']:
+        del locals()[k]
+    torch.cuda.empty_cache()
+    return mat
+
+def attention_map(mat, model=None, filepath='/home/jupyter/notebooks/checkpoints/segmentation_count_hardmask.pt', 
+                  batch_size=5000, return_detached=True, device=torch.device('cuda')):
+    if model is None:
+        model = UNet(in_channels=1, num_classes=1, out_channels=[4, 8, 16], num_conv=2, n_dim=3, 
+                     kernel_size=[3, 3, 3], same_shape=True).to(device)
+        model.load_state_dict(torch.load(filepath))
+    nrow, ncol = mat.shape[1:]
+    if batch_size*nrow*ncol > 1e7:
+        batch_size = int(1e7 / (nrow*ncol))
+    with torch.no_grad():
+        num_batches = (mat.size(0) + batch_size - 1)//batch_size
+        mat = torch.cat([model(mat[batch_size*i:batch_size*(i+1)]) for i in range(num_batches)], dim=0).mean(0)
+    if return_detached:
+        mat = mat.detach()
+    for k in [k for k in locals().keys() if k!='mat']:
+        del locals()[k]
+    torch.cuda.empty_cache()
+    return mat
+
+def refine_one_label(submat, min_pixels=50, return_traces=False, percentile=50):
+    soft_attention = attention_map(submat)
+    label_image, regions = get_label_image(soft_attention, min_pixels=min_pixels)
+    if return_traces:
+        submats, traces = extract_traces(submat, softmask=soft_attention, label_image=label_image, regions=regions, 
+                                         percentile=percentile)
+        return submats, traces, soft_attention, label_image, regions
+    else:
+        return label_image
+    
+def refine_segmentation(submats, regions, label_image, min_pixels=50, min_pixels_super=900, connectivity=None):
+    for label_idx in range(1, len(submats)+1):
+        if (label_image==label_idx).sum() >= min_pixels_super:
+            submat = submats[label_idx-1]
+            minr, minc, maxr, maxc = regions[label_idx-1].bbox
+            img = refine_one_label(submat, min_pixels=min_pixels)
+            label_image[minr:maxr, minc:maxc] = img
+    from skimage.measure import label, regionprops
+    label_image = label(label_image>0, connectivity=connectivity)
+    regions = regionprops(label_image)
+    return label_image, regions
+
+
+def basic_segmentation(mat, min_thresh=0.05, min_pixels=50, show=True, median_detrend=False, fft=False, fft_max_freq=200):
+    if median_detrend:
+        mat = mat - get_local_median(mat, window_size=50, dim=-3)
+    if fft:
+        if mat.ndim == 3:
+            mat = torch.rfft(mat.transpose(0, 2), signal_ndim=1, normalized=True)[..., :fft_max_freq, :].reshape(
+                mat.size(2), mat.size(1), -1).transpose(0, 2)
+        elif mat.ndim == 4:
+            mat = torch.rfft(mat.transpose(1, 3), signal_ndim=1, normalized=True)[..., :fft_max_freq, :].reshape(
+                mat.size(0), mat.size(3), mat.size(2), -1).transpose(1, 3)
+    if mat.ndim == 3:
+        cor_map = get_cor_map(mat)
+    elif mat.ndim == 4:
+        cor_map = get_cor_map_4d(mat)
+    label_image, regions = get_label_image(cor_map, min_thresh=min_thresh, min_pixels=min_pixels)
+    label_image = torch.from_numpy(label_image).to(mat.device)
+    if show:
+        imshow(cor_map)
+        plot_image_label_overlay(cor_map, label_image=label_image, regions=regions)
+    return cor_map, label_image, regions
+
+
+def entire_pipeline(bucket, denoise=False, spectral_clustering=False, semi_supervised=False, result_folder='results', 
+                    bin_files=None, delete_local_data=False, apply_detrend=True, device=torch.device('cuda')):
+    # bucket = 'gs://broad-opp-voltage/2020-07-16_VoltageMovies_SCDN010'
+    # bucket = 'gs://broad-opp-voltage/2020-07-23_VoltageMovies_SCDN011'
+    # bucket = 'gs://broad-opp-voltage/2020-07-30_VoltageMovies_MIN002'
+    command = ['gsutil', 'ls', bucket]
+    response = subprocess.run(command, capture_output=True)
+    assert response.returncode == 0
+    filepaths = response.stdout.decode().split()
+    if bin_files is not None:
+        if isinstance(bin_files, str):
+            bin_files = [bin_files]
+    else:
+        bin_files = sorted([f.split('.')[0].split('/')[-1] for f in filepaths if re.search('.bin$', f)])
+    json_files = [f'{file}_metadata' for file in bin_files] #unused
+
+    data_folder = bucket.split('/')[-1]
+    if not os.path.exists(data_folder):
+        os.makedirs(data_folder)
+    if not os.path.exists(f'{data_folder}/{result_folder}'):
+        print(f'Create folder {data_folder}/{result_folder}')
+        os.makedirs(f'{data_folder}/{result_folder}')
+    if not os.path.exists(f'{data_folder}/json'):
+        print(f'Create folder {data_folder}/json')
+        os.makedirs(f'{data_folder}/json')
+        command = ['gsutil', '-m', 'cp', f'{bucket}/*.json', f'{data_folder}/json']
+        response = subprocess.run(command, capture_output=True)
+        assert response.returncode == 0
+
+    meta_data = {}
+    for file in bin_files:
+        meta_file = f'{data_folder}/json/{file}_metadata.json'
+        if not os.path.exists(meta_file):
+            command = ['gsutil', 'cp', f'{bucket}/{file}_metadata.json', meta_file]
+            response = subprocess.run(command, capture_output=True)
+            if response.returncode != 0:
+                print(f'{meta_file} does not exist!')
+                continue
+        command = ['sed', '-i', 's/Null/null/g', meta_file] # substitute Null with null
+        response = subprocess.run(command, capture_output=True)
+        assert response.returncode == 0
+        command = ['sed', '-i', '/:/!d', meta_file] # remove lines starting without ':'
+        response = subprocess.run(command, capture_output=True)
+        assert response.returncode == 0
+        command = ['sed', '-i', '1i {', meta_file] # add first line '{' 
+        response = subprocess.run(command, capture_output=True)
+        assert response.returncode == 0
+        command = ['sed', '-i', '-e', '$a}', meta_file] # add last line '}' 
+        response = subprocess.run(command, capture_output=True)
+        assert response.returncode == 0
+        with open(meta_file, 'r') as f:
+            meta_data[file] = json.load(f)
+    bin_files = [k for k in bin_files if k in meta_data]
+
+    start_time = time.time()
+    for file in bin_files[:1]:
+        print(f'Process {file}')
+        if not os.path.exists(f'{data_folder}/{file}.bin'):
+            command = ['gsutil', '-m', 'cp', f'{bucket}/{file}.bin', data_folder]
+            response = subprocess.run(command, capture_output=True)
+            assert response.returncode == 0
+        save_folder = f'{data_folder}/{result_folder}/{file}'
+        if not os.path.exists(save_folder):
+            print(f'Create folder {save_folder}')
+            os.makedirs(save_folder)
+
+        nframe = meta_data[file]['numFramesRequested']
+        ncol, nrow = meta_data[file]['movSize']
+        torch.cuda.empty_cache()
+        mat = load_file(f'{data_folder}/{file}.bin', size=(nframe, nrow, ncol), device=device)
+        temporal_mean = mat.mean(0)
+        spatial_mean = mat.mean((1,2))
+        if 'blueFrameOnOff' in meta_data[file]:
+            blue_light_on_off = np.array(meta_data[file]['blueFrameOnOff']).reshape(-1, 2)
+            cor_map, label_image, regions = basic_segmentation(
+                torch.stack([mat[i-1:j-1] for i, j in blue_light_on_off], dim=0), min_pixels=20,
+                show=False, median_detrend=False, fft=False, fft_max_freq=200)
+        else:
+            num_segments = 10
+            start_idx = 251
+            end_idx = 750
+            start_seg = 2
+            end_seg = 10
+            frames_per_segment = nframe // num_segments
+            blue_light_on_off = np.array([[start_idx + i*frames_per_segment, end_idx + i*frames_per_segment] 
+                                          for i in range(start_seg, end_seg)])
+            if apply_detrend:
+                train_idx = list(range(100, start_idx-5)) + list(range(end_idx+100, frames_per_segment-5))
+                mat = mat.view(num_segments, frames_per_segment, nrow, ncol)
+                mat = torch.cat([detrend_linear(m, train_idx=train_idx) for m in mat], dim=0)
+                cor_map, label_image, regions = basic_segmentation(
+                    torch.stack([mat[i*frames_per_segment+start_idx:i*frames_per_segment+end_idx] for i in range(start_seg, end_seg)], dim=0), 
+                    show=False, median_detrend=False, fft=False, fft_max_freq=200)
+            else:
+                cor_map, label_image, regions = basic_segmentation(
+                    torch.stack([mat[i-1:j-1] for i, j in blue_light_on_off], dim=0), min_pixels=20,
+                    show=False, median_detrend=False, fft=False, fft_max_freq=200)
+        submats, traces = extract_traces(mat, softmask=cor_map, label_image=label_image, regions=regions, median_detrend=False)
+
+        display = True
+        imshow(cor_map, save_file=f'{save_folder}/cor_map.png', title=f'{file}: min_cor={cor_map.min():.2f}, max_cor={cor_map.max():.2f}', 
+               display=display)
+        plot_image_label_overlay(cor_map, label_image=label_image, regions=regions, save_file=f'{save_folder}/basic_segmentation.png', 
+                                 title=f'{file}: {label_image.max()} neurons detected', 
+                                 display=display)
+
+        np.save(f'{save_folder}/cor_map.npy', cor_map.cpu().numpy())
+        if len(traces) > 0:
+            print(f'{len(traces)} neuron detected in {file}.bin')
+            np.save(f'{save_folder}/label_image__basic_segmentation.npy', label_image.cpu().numpy())
+            np.save(f'{save_folder}/traces__basic_segmentation.npy', traces.cpu().numpy())
+        os.remove(f'{data_folder}/{file}.bin')
+
+    end_time = time.time()
+    print(end_time - start_time)
+
+    figsize = (20, 20)
+    bounding_box = True
+    for file in bin_files:
+        save_folder = f'{data_folder}/{result_folder}/{file}'
+        if os.path.exists(f'{save_folder}/label_image__basic_segmentation.npy'):
+            cor_map = np.load(f'{save_folder}/cor_map.npy')
+            label_image = np.load(f'{save_folder}/label_image__basic_segmentation.npy')
+            traces = np.load(f'{save_folder}/traces__basic_segmentation.npy')
+            image_label_overlay = label2rgb(label_image, image=cor_map)
+            regions = regionprops(label_image)
+            if not os.path.exists(f'{save_folder}/figs'):
+                os.makedirs(f'{save_folder}/figs')
+            for sel_idx in range(label_image.max()):
+                fig, ax = plt.subplots(2, figsize=figsize)
+                ax[0].imshow(image_label_overlay)
+                if bounding_box:
+                    region = regions[sel_idx]
+                    minr, minc, maxr, maxc = region.bbox
+                    rect = mpatches.Rectangle((minc, minr), maxc - minc, maxr - minr,
+                                              fill=False, edgecolor='red', linewidth=2)
+                    ax[0].add_patch(rect)
+                    ax[0].text(minc-3, minr-1, sel_idx+1, color='r')
+                ax[0].set_axis_off()
+                ax[0].set_title(f'Neuron {sel_idx+1} segmentation')
+                ax[1].plot(traces[sel_idx])
+                ax[1].set_title(f'Neuron {sel_idx+1} trace')
+                plt.tight_layout()
+                plt.savefig(f'{save_folder}/figs/{sel_idx+1}.png')
+                plt.close()
+            imgs = [f'{save_folder}/figs/{i+1}.png' for i in range(label_image.max())]
+            save_gif_file(imgs, save_path=f'{save_folder}/figs/{label_image.max()}_neurons.gif')
+
+    command = ['gsutil', '-m', 'cp', '-r', 
+               f'{data_folder}/{result_folder}', 
+               f'{bucket}/']
+    response = subprocess.run(command, capture_output=True)
+    assert response.returncode == 0
+    if delete_local_data:
+        shutil.rmtree(data_folder)

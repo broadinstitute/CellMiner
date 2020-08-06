@@ -9,6 +9,16 @@ import torch
 import torch.nn as nn
 
 
+class MinPool(nn.Module):
+    def __init__(self, kernel_size, ndim=3, stride=None, padding=0, dilation=1, return_indices=False, ceil_mode=False):
+        super(MinPool, self).__init__()
+        self.pool = getattr(nn, f'MaxPool{ndim}d')(kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation,
+                                                  return_indices=return_indices, ceil_mode=ceil_mode)
+    def forward(self, x):
+        x_max = x.max() # because of zero padding
+        x = self.pool(x_max - x)
+        return x_max - x
+    
 class DenseNet(nn.Module):
     def __init__(self, in_dim, hidden_dims, dense=False, residual=False, nonlinearity=nn.LeakyReLU()):
         super(DenseNet, self).__init__()
@@ -70,15 +80,21 @@ class MultiConv(nn.Module):
     
     """
     def __init__(self, in_channels, out_channels, num_conv=2, n_dim=2, kernel_size=3, padding=1, padding_mode='replicate', same_shape=True, 
-                 normalization='layer_norm', activation=nn.LeakyReLU(negative_slope=0.01, inplace=True)):
+                 normalization='layer_norm', activation=nn.LeakyReLU(negative_slope=0.01, inplace=True), last_layer_activation=True):
         super(MultiConv, self).__init__()
+        if isinstance(out_channels, int):
+            out_channels = [out_channels] * num_conv
+        if num_conv is None:
+            num_conv = len(out_channels)
         self.num_conv = num_conv
+        assert self.num_conv == len(out_channels)
         if n_dim == 3:
             Conv = nn.Conv3d
         elif n_dim == 2:
             Conv = nn.Conv2d
         elif n_dim == 1:
             Conv = nn.Conv1d
+        self.last_layer_activation = last_layer_activation
         # self.padding needs to be an Iterable here if same_shape is False and padding_mode is 'reflect' or 'replicate'
         self.padding = padding if isinstance(padding, collections.abc.Iterable) else [padding]*n_dim
         self.padding_mode = padding_mode
@@ -107,18 +123,20 @@ class MultiConv(nn.Module):
         self.conv = nn.ModuleList()
         self.norm = nn.ModuleList()
         for i in range(self.num_conv):
-            self.conv.append(Conv(in_channels if i==0 else out_channels, out_channels, kernel_size, 
+            self.conv.append(Conv(in_channels if i==0 else out_channels[i-1], out_channels[i], kernel_size, 
                                   padding=0 if self.padding_mode in ['reflect', 'replicate'] else self.padding,
                                   padding_mode=self.padding_mode))
             if normalization == 'layer_norm':
                 num_groups = 1
             elif normalization == 'instance_norm':
-                num_groups = out_channels
+                num_groups = out_channels[i]
             elif isinstance(normalization, int):
                 num_groups = normalization
+            elif normalization is None:
+                num_groups = 0
             else:
                 raise ValueError(f'normalization = {normalization} not defined!')
-            self.norm.append(nn.GroupNorm(num_groups=num_groups, num_channels=out_channels))
+            self.norm.append(nn.GroupNorm(num_groups=num_groups, num_channels=out_channels[i]) if num_groups>0 else nn.Identity())
         self.activation = activation
         
     def forward(self, x):
@@ -128,7 +146,10 @@ class MultiConv(nn.Module):
                 for p in self.padding:
                     expanded_padding += [(p+1)//2, p//2]
                 x = nn.functional.pad(x, expanded_padding, mode=self.padding_mode)
-            x = self.activation(self.norm[i](self.conv[i](x)))
+            if not self.last_layer_activation and i == self.num_conv-1:
+                x = self.conv[i](x)
+            else:
+                x = self.activation(self.norm[i](self.conv[i](x)))
         return x
 
     
@@ -140,7 +161,7 @@ class DownConv(nn.Module):
     Examples:
     """
     def __init__(self, in_channels, out_channels, num_conv=2, n_dim=2, kernel_size=3, padding=1, padding_mode='replicate', same_shape=True, 
-                 normalization='layer_norm', activation=nn.LeakyReLU(negative_slope=0.01, inplace=True)):
+                 pool_kernel_size=2, normalization='layer_norm', activation=nn.LeakyReLU(negative_slope=0.01, inplace=True)):
         super(DownConv, self).__init__()
         self.n_dim = n_dim
         if self.n_dim==3:
@@ -149,7 +170,7 @@ class DownConv(nn.Module):
             Maxpool = nn.MaxPool2d
         elif self.n_dim==1:
             Maxpool = nn.MaxPool1d
-        self.downconv = nn.Sequential(Maxpool(kernel_size=2), 
+        self.downconv = nn.Sequential(Maxpool(kernel_size=pool_kernel_size), 
                                       MultiConv(in_channels, out_channels, num_conv=num_conv, n_dim=n_dim, kernel_size=kernel_size, padding=padding,
                                                 padding_mode=padding_mode, same_shape=same_shape, normalization=normalization, activation=activation))
     
@@ -158,7 +179,7 @@ class DownConv(nn.Module):
         size = x.size()
         pad = []
         for s in reversed(size[-self.n_dim:]):
-            if s == 1:
+            if s == 1: # this is a corner case
                 pad = pad + [0, 1]
             else:
                 pad = pad + [0, 0]
@@ -175,31 +196,36 @@ class UpConv(nn.Module):
     Examples:
     """
     def __init__(self, in_channels, out_channels, num_conv=2, n_dim=2, kernel_size=3, padding=1, padding_mode='replicate', same_shape=True, 
-                 normalization='layer_norm', activation=nn.LeakyReLU(negative_slope=0.01, inplace=True)):
+                 normalization='layer_norm', use_adaptive_pooling=False, transpose_kernel_size=2, transpose_stride=2, 
+                 activation=nn.LeakyReLU(negative_slope=0.01, inplace=True)):
         super(UpConv, self).__init__()
         self.n_dim = n_dim
         self.padding_mode = padding_mode
+        self.use_adaptive_pooling = use_adaptive_pooling
         if self.n_dim==3:
             ConvTranspose = nn.ConvTranspose3d
         elif self.n_dim==2:
             ConvTranspose = nn.ConvTranspose2d
         elif self.n_dim==1:
             ConvTranspose = nn.ConvTranspose1d
-        self.up = ConvTranspose(in_channels//2, in_channels//2, kernel_size=2, stride=2) # parameterizable
+        self.up = ConvTranspose(in_channels//2, in_channels//2, kernel_size=transpose_kernel_size, stride=transpose_stride) # parameterizable
         self.conv = MultiConv(in_channels, out_channels, num_conv=num_conv, n_dim=self.n_dim, kernel_size=kernel_size, padding=padding, 
                               padding_mode=padding_mode, same_shape=same_shape, normalization=normalization, activation=activation)
         
     def forward(self, x1, x2):
         x1 = self.up(x1)
-        dw = x2.size(-1) - x1.size(-1)
-        pad = [dw//2, dw-dw//2]
-        if self.n_dim > 1:
-            dh = x2.size(-2) - x1.size(-2)
-            pad = pad + [dh//2, dh-dh//2]
-        if self.n_dim > 2:
-            dd = x2.size(-3) - x1.size(-3)
-            pad = pad + [dd//2, dd - dd//2]
-        x1 = nn.functional.pad(x1, pad, mode='constant' if self.padding_mode=='zeros' else self.padding_mode)
+        if self.use_adaptive_pooling:
+            x2 = getattr(nn, f'AdaptiveMaxPool{self.n_dim}d')(x1.shape[2:])(x2)
+        else:
+            dw = x2.size(-1) - x1.size(-1)
+            pad = [dw//2, dw-dw//2]
+            if self.n_dim > 1:
+                dh = x2.size(-2) - x1.size(-2)
+                pad = pad + [dh//2, dh-dh//2]
+            if self.n_dim > 2:
+                dd = x2.size(-3) - x1.size(-3)
+                pad = pad + [dd//2, dd - dd//2]
+            x1 = nn.functional.pad(x1, pad, mode='constant' if self.padding_mode=='zeros' else self.padding_mode)
         return self.conv(torch.cat([x1, x2], dim=1))
 
     
@@ -225,31 +251,52 @@ class UNet(nn.Module):
         model(x).shape
     """
     def __init__(self, in_channels, num_classes, out_channels=[64, 128, 256, 512], num_conv=2, n_dim=2, kernel_size=3, padding=1, 
-                 padding_mode='replicate', same_shape=True, normalization='layer_norm', activation=nn.LeakyReLU(negative_slope=0.01, inplace=True)):
+                 padding_mode='replicate', same_shape=True, normalization='layer_norm', pool_kernel_size=2, use_adaptive_pooling=False,
+                 transpose_kernel_size=2, transpose_stride=2, last_out_channels=None,
+                 activation=nn.LeakyReLU(negative_slope=0.01, inplace=True)):
         super(UNet, self).__init__()
+        encoder_depth = len(out_channels)
+        if isinstance(kernel_size, int) or (isinstance(kernel_size, tuple) and len(kernel_size)!=2*encoder_depth+1):
+            kernel_size = [kernel_size] * (2*encoder_depth+1)
+        if isinstance(padding, int):
+            padding = [padding] * (2*encoder_depth+1)
+        if isinstance(pool_kernel_size, int):
+            pool_kernel_size = [pool_kernel_size] * encoder_depth
+        if isinstance(transpose_kernel_size, int):
+            transpose_kernel_size = [transpose_kernel_size] * encoder_depth
+        if isinstance(transpose_stride, int):
+            transpose_stride = [transpose_stride] * encoder_depth
         self.ndim = n_dim
-        self.conv = MultiConv(in_channels, out_channels[0], num_conv=num_conv, n_dim=n_dim, kernel_size=kernel_size, padding=padding, 
-                              padding_mode=padding_mode, same_shape=same_shape, normalization=normalization, activation=activation)
+        self.conv = MultiConv(in_channels, out_channels[0], num_conv=num_conv, n_dim=n_dim, kernel_size=kernel_size[0], padding=padding[0], 
+                              padding_mode=padding_mode, same_shape=True, normalization=normalization, activation=activation)
         self.encoder = nn.Sequential(collections.OrderedDict(
             [(f'down{i}', 
               DownConv(out_channels[i], out_channels[i+1] if i < len(out_channels)-1 else out_channels[-1], num_conv=num_conv, n_dim=n_dim, 
-                       kernel_size=kernel_size, padding=padding, padding_mode=padding_mode, same_shape=same_shape, normalization=normalization, 
-                       activation=activation)) 
-             for i in range(len(out_channels))]))
+                       kernel_size=kernel_size[i+1], padding=padding[i+1], padding_mode=padding_mode, same_shape=same_shape, 
+                       pool_kernel_size=pool_kernel_size[i], normalization=normalization, activation=activation)) 
+             for i in range(encoder_depth)]))
         self.decoder = nn.Sequential(collections.OrderedDict(
             [(f'up{i}', 
-              UpConv(out_channels[i]*2, out_channels[i-1] if i > 0 else out_channels[0], num_conv=num_conv, n_dim=n_dim, kernel_size=kernel_size, 
-                     padding=padding, padding_mode=padding_mode, same_shape=same_shape, normalization=normalization, activation=activation))
-             for i in reversed(range(len(out_channels)))]))
-        if n_dim==3:
-            Conv = nn.Conv3d
-        elif n_dim==2:
-            Conv = nn.Conv2d
-        elif n_dim==1:
-            Conv = nn.Conv1d
-        self.out = Conv(out_channels[0], num_classes, 1)
+              UpConv(out_channels[i]*2, out_channels[i-1] if i > 0 else out_channels[0], num_conv=num_conv, n_dim=n_dim, 
+                     kernel_size=kernel_size[2*encoder_depth-i], padding=padding[2*encoder_depth-i], use_adaptive_pooling=use_adaptive_pooling,
+                     transpose_kernel_size=transpose_kernel_size[encoder_depth-1-i], transpose_stride=transpose_stride[encoder_depth-1-i],
+                     padding_mode=padding_mode, same_shape=same_shape, normalization=normalization, activation=activation))
+             for i in reversed(range(encoder_depth))]))
+        if isinstance(last_out_channels, (tuple, list)) and len(last_out_channels) > 0:
+            self.out = MultiConv(in_channels=out_channels[0], out_channels=list(last_out_channels)+[num_classes], 
+                                 num_conv=len(last_out_channels)+1, n_dim=n_dim, kernel_size=1, padding=0, normalization=normalization,
+                                 activation=activation, last_layer_activation=False)
+        else:
+            if n_dim==3:
+                Conv = nn.Conv3d
+            elif n_dim==2:
+                Conv = nn.Conv2d
+            elif n_dim==1:
+                Conv = nn.Conv1d
+            self.out = Conv(out_channels[0], num_classes, 1)
+            
         
-    def forward(self, x):
+    def forward(self, x, encoder_only=False):
         add_ndim = self.ndim + 2 - x.ndim
         for i in range(add_ndim):
             x = x.unsqueeze(0)
@@ -258,6 +305,8 @@ class UNet(nn.Module):
         for m in self.encoder:
             x = m(x)
             xs.append(x)
+        if encoder_only:
+            return x
         for i, m in enumerate(self.decoder):
             x = m(x, xs[-i-2])
         x = self.out(x)
